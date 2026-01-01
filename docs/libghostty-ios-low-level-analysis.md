@@ -2,12 +2,13 @@
 
 ## 1. 核心问题概述
 
-在 iOS 上运行 libghostty 存在三个底层技术障碍：
+在 iOS 上运行 libghostty 存在四个底层技术障碍：
 
 | 问题 | 根源位置 | 严重程度 |
 |-----|---------|---------|
 | **PTY 不可用** | `src/pty.zig` | 致命 - iOS 沙盒禁止 fork/exec |
-| **libxev kevent 限制** | libxev 库 | 严重 - iOS 沙盒对 kqueue 有限制 |
+| **libxev EVFILT_PROC** | libxev 库 | 致命 - iOS 沙盒禁止进程监视 |
+| **libxev Async (Mach Ports)** | libxev 库 | 严重 - iOS Mach 端口受限 |
 | **termio 架构耦合** | `src/termio/` | 中等 - 与 PTY 紧密耦合 |
 
 ---
@@ -232,9 +233,337 @@ pub fn resize(self: *Exec, grid_size: renderer.GridSize,
 
 ---
 
-## 5. 改造方案：管道后端 (Pipe Backend)
+## 5. 问题四：libxev 异步机制深度分析
 
-### 5.1 架构设计
+这是 Discussion #4087 中 kitknox 提到的核心问题：
+
+> "libghostty was already in a state that it compiled on iOS, it did not actually work on iOS.
+> The kevent queues in `libxev` didn't work on iOS without fixes."
+> "These were all async crashes"
+
+### 5.1 libxev kqueue 后端架构
+
+libxev 在 Darwin 平台（macOS/iOS）使用 kqueue 作为事件循环后端：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     libxev kqueue 后端                           │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐ │
+│  │   xev.Async     │  │   xev.Process   │  │   xev.Timer     │ │
+│  │ (EVFILT_MACHPORT│  │ (EVFILT_PROC)   │  │ (Timer Heap)    │ │
+│  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘ │
+│           │                    │                    │           │
+│           └────────────────────┼────────────────────┘           │
+│                                ▼                                 │
+│                    ┌───────────────────────┐                    │
+│                    │      kqueue()         │                    │
+│                    │   (kevent syscall)    │                    │
+│                    └───────────────────────┘                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 iOS 沙盒对 kqueue 过滤器的限制
+
+| kqueue 过滤器 | 用途 | macOS | iOS | 问题原因 |
+|--------------|------|-------|-----|---------|
+| `EVFILT_READ` | 文件/Socket 读 | ✅ | ✅ | - |
+| `EVFILT_WRITE` | 文件/Socket 写 | ✅ | ✅ | - |
+| `EVFILT_TIMER` | 定时器 | ✅ | ✅ | - |
+| `EVFILT_PROC` | 进程监视 | ✅ | ❌ | **沙盒禁止监视其他进程** |
+| `EVFILT_MACHPORT` | Mach 端口 | ✅ | ⚠️ | **部分 Mach API 受限** |
+| `EVFILT_USER` | 用户事件 | ✅ | ⚠️ | **需要测试** |
+
+### 5.3 xev.Async 实现分析
+
+libxev 的 `Async` 在 Darwin 上使用 **Mach Ports**:
+
+```zig
+// libxev kqueue.zig 中的 Async 实现
+// 使用 EVFILT_MACHPORT 和 Mach 消息传递
+
+pub const Async = struct {
+    mach_port: mach_port_t,  // Mach 端口
+
+    pub fn init() !Async {
+        // 创建 Mach 端口
+        const port = mach_port_allocate(...);
+        return .{ .mach_port = port };
+    }
+
+    pub fn notify(self: *Async) !void {
+        // 发送 Mach 消息唤醒等待者
+        mach_msg_send(...);
+    }
+
+    pub fn wait(self: *Async, loop: *Loop, ...) void {
+        // 使用 EVFILT_MACHPORT 监听端口
+        kevent(..., EVFILT_MACHPORT, ...);
+    }
+};
+```
+
+**iOS Mach 端口限制**:
+- iOS 沙盒对 Mach 端口有严格的 IPC 限制
+- 某些 Mach API 在沙盒应用中可能失败
+- 端口分配和消息发送可能需要特殊权限
+
+### 5.4 xev.Process 实现分析
+
+```zig
+// libxev kqueue.zig 中的 Process 实现
+pub const Process = struct {
+    pid: pid_t,
+
+    pub fn init(pid: pid_t) !Process {
+        return .{ .pid = pid };
+    }
+
+    pub fn wait(self: *Process, loop: *Loop, ...) void {
+        // 使用 EVFILT_PROC 监视进程
+        kevent(loop.fd, &[_]Kevent{
+            .{
+                .ident = @intCast(self.pid),
+                .filter = EVFILT_PROC,
+                .flags = EV_ADD | EV_ONESHOT,
+                .fflags = NOTE_EXIT | NOTE_EXITSTATUS,
+                ...
+            }
+        }, ...);
+    }
+};
+```
+
+**iOS 上 EVFILT_PROC 完全不可用**:
+- iOS 沙盒禁止应用监视其他进程
+- 即使是自己 fork 的子进程也无法监视（因为 iOS 禁止 fork）
+- 这是 Ghostty 在 iOS 上的致命问题之一
+
+### 5.5 Ghostty 中 xev.Async 的所有使用位置
+
+| 文件 | 用途 | 类型 | iOS 风险 |
+|------|------|------|---------|
+| `src/termio/Thread.zig:55` | 停止信号 | `stop: xev.Async` | ⚠️ 高 |
+| `src/termio/Thread.zig:67` | 立即绘制 | `draw_now: xev.Async` | ⚠️ 高 |
+| `src/termio/mailbox.zig:32` | 唤醒 | `wakeup: xev.Async` | ⚠️ 高 |
+| `src/renderer/Thread.zig:47` | 唤醒 | `wakeup: xev.Async` | ⚠️ 高 |
+| `src/renderer/Thread.zig:51` | 停止 | `stop: xev.Async` | ⚠️ 高 |
+| `src/renderer/Thread.zig:67` | 立即绘制 | `draw_now: xev.Async` | ⚠️ 高 |
+| `src/terminal/search/Thread.zig:55` | 唤醒 | `wakeup: xev.Async` | ⚠️ 高 |
+| `src/terminal/search/Thread.zig:59` | 停止 | `stop: xev.Async` | ⚠️ 高 |
+| `src/termio/Termio.zig:47` | 渲染器唤醒 | `renderer_wakeup: xev.Async` | ⚠️ 高 |
+| `src/os/cf_release_thread.zig:40` | 唤醒 | `wakeup: xev.Async` | ⚠️ 高 |
+
+### 5.6 xev.Process 在 Ghostty 中的使用
+
+```zig
+// src/termio/Exec.zig:105-115
+var process: ?xev.Process = if (self.subprocess.process) |v|
+    switch (v) {
+        .fork_exec => |cmd| try xev.Process.init(
+            cmd.pid orelse return error.ProcessNoPid,
+        ),
+        .flatpak => null,
+    }
+else return error.ProcessNotStarted;
+```
+
+**这段代码在 iOS 上会导致崩溃**，因为:
+1. iOS 不允许 fork，所以 `subprocess.process` 永远是 null
+2. 即使有 PID，`xev.Process.init` 也会失败
+
+### 5.7 kitknox 的修复方案推测
+
+根据讨论中的描述，kitknox 可能采取了以下修复:
+
+**方案 A: 替换 Mach 端口为管道**
+```zig
+// 使用 pipe() + poll() 替代 Mach 端口
+pub const Async = struct {
+    pipe_fds: [2]fd_t,
+
+    pub fn init() !Async {
+        const fds = try posix.pipe();
+        return .{ .pipe_fds = fds };
+    }
+
+    pub fn notify(self: *Async) !void {
+        _ = try posix.write(self.pipe_fds[1], &[_]u8{1});
+    }
+
+    pub fn wait(self: *Async, loop: *Loop) void {
+        // 使用 EVFILT_READ 监听管道
+        kevent(..., EVFILT_READ, self.pipe_fds[0], ...);
+    }
+};
+```
+
+**方案 B: 使用 dispatch_source (Apple 推荐)**
+```zig
+// 使用 Grand Central Dispatch
+pub const Async = struct {
+    source: dispatch_source_t,
+
+    pub fn init() !Async {
+        const queue = dispatch_get_global_queue(...);
+        const source = dispatch_source_create(
+            DISPATCH_SOURCE_TYPE_DATA_ADD, 0, 0, queue
+        );
+        return .{ .source = source };
+    }
+
+    pub fn notify(self: *Async) !void {
+        dispatch_source_merge_data(self.source, 1);
+    }
+};
+```
+
+### 5.8 iOS 异步问题的完整修复清单
+
+| 问题 | 当前实现 | 修复方案 | 优先级 |
+|------|---------|---------|--------|
+| `xev.Async` 崩溃 | Mach 端口 | 使用 pipe + EVFILT_READ | P0 |
+| `xev.Process` 不可用 | EVFILT_PROC | 管道后端不需要进程监视 | P0 |
+| 事件循环初始化失败 | kqueue 创建 | 应该可用，需测试 | P1 |
+| Timer 问题 | Timer Heap | 应该可用，需测试 | P2 |
+
+### 5.9 libxev iOS 修复方案
+
+#### 方案一：Fork libxev 添加 iOS 支持 (推荐)
+
+创建 libxev 的 fork 版本，针对 iOS 修改 kqueue 后端：
+
+**修改文件**: `src/backend/kqueue.zig`
+
+```zig
+// 1. 修改 Async 实现，使用管道替代 Mach 端口
+pub const Async = struct {
+    // iOS: 使用管道
+    // macOS: 保持 Mach 端口
+    backend: if (builtin.os.tag == .ios) PipeAsync else MachPortAsync,
+
+    const PipeAsync = struct {
+        read_fd: posix.fd_t,
+        write_fd: posix.fd_t,
+
+        pub fn init() !PipeAsync {
+            const fds = try posix.pipe();
+            // 设置非阻塞
+            _ = try posix.fcntl(fds[0], .F_SETFL, posix.O.NONBLOCK);
+            return .{ .read_fd = fds[0], .write_fd = fds[1] };
+        }
+
+        pub fn deinit(self: *PipeAsync) void {
+            posix.close(self.read_fd);
+            posix.close(self.write_fd);
+        }
+
+        pub fn notify(self: *PipeAsync) !void {
+            _ = posix.write(self.write_fd, &[_]u8{1}) catch |err| switch (err) {
+                error.WouldBlock => {}, // 忽略，已经有通知待处理
+                else => return err,
+            };
+        }
+
+        pub fn wait(self: *PipeAsync, loop: *Loop, c: *Completion) void {
+            // 使用 EVFILT_READ 替代 EVFILT_MACHPORT
+            c.* = .{
+                .op = .{ .async_wait = .{ .async = self } },
+                .kevent = .{
+                    .ident = @intCast(self.read_fd),
+                    .filter = std.c.EVFILT.READ,
+                    .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.ONESHOT,
+                    .fflags = 0,
+                    .data = 0,
+                    .udata = @intFromPtr(c),
+                },
+            };
+            loop.add(c);
+        }
+
+        pub fn drain(self: *PipeAsync) void {
+            // 排空管道中的所有通知字节
+            var buf: [64]u8 = undefined;
+            while (true) {
+                _ = posix.read(self.read_fd, &buf) catch break;
+            }
+        }
+    };
+};
+```
+
+#### 方案二：条件编译跳过问题组件
+
+在 Ghostty 中添加 iOS 条件编译：
+
+```zig
+// src/termio/Exec.zig
+pub fn threadEnter(...) !void {
+    // ...
+
+    // iOS: 不使用进程监视
+    var process: ?xev.Process = if (comptime builtin.os.tag == .ios)
+        null
+    else if (self.subprocess.process) |v|
+        switch (v) {
+            .fork_exec => |cmd| try xev.Process.init(cmd.pid),
+            .flatpak => null,
+        }
+    else
+        return error.ProcessNotStarted;
+
+    // ...
+}
+```
+
+#### 方案三：使用 Zig 标准库替代
+
+对于某些场景，可以使用 Zig 标准库的线程原语替代 xev.Async：
+
+```zig
+const std = @import("std");
+
+pub const SimpleAsync = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    signaled: bool = false,
+
+    pub fn notify(self: *SimpleAsync) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.signaled = true;
+        self.cond.signal();
+    }
+
+    pub fn wait(self: *SimpleAsync) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (!self.signaled) {
+            self.cond.wait(&self.mutex);
+        }
+        self.signaled = false;
+    }
+};
+```
+
+**注意**: 这种方案不能与 xev.Loop 集成，需要独立的等待线程。
+
+### 5.10 libxev 修复的工作量评估
+
+| 任务 | 复杂度 | 时间估计 |
+|------|--------|---------|
+| Fork libxev 并设置构建 | 低 | 0.5 天 |
+| 实现 PipeAsync 替代 | 中 | 1-2 天 |
+| 禁用/存根 Process | 低 | 0.5 天 |
+| 测试基本事件循环 | 中 | 1 天 |
+| 集成到 Ghostty | 中 | 1 天 |
+| **总计** | | **4-5 天** |
+
+---
+
+## 6. 改造方案：管道后端 (Pipe Backend)
+
+### 6.1 架构设计
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -292,7 +621,7 @@ pub fn resize(self: *Exec, grid_size: renderer.GridSize,
                           └─────────────────────┘
 ```
 
-### 5.2 新增文件: `src/termio/Pipe.zig`
+### 6.2 新增文件: `src/termio/Pipe.zig`
 
 ```zig
 //! Pipe 后端实现，用于 iOS 等无 PTY 环境
@@ -575,7 +904,7 @@ fn readThreadMain(
 }
 ```
 
-### 5.3 修改 `src/termio/backend.zig`
+### 6.3 修改 `src/termio/backend.zig`
 
 ```zig
 const std = @import("std");
@@ -676,7 +1005,7 @@ pub const ThreadData = union(Kind) {
 };
 ```
 
-### 5.4 修改 `src/pty.zig` - 添加 PipePty
+### 6.4 修改 `src/pty.zig` - 添加 PipePty
 
 ```zig
 pub const Pty = switch (builtin.os.tag) {
@@ -759,9 +1088,9 @@ pub const PipePty = struct {
 
 ---
 
-## 6. C API 扩展
+## 7. C API 扩展
 
-### 6.1 新增 API 函数 (`include/ghostty.h`)
+### 7.1 新增 API 函数 (`include/ghostty.h`)
 
 ```c
 // 管道后端配置
@@ -798,7 +1127,7 @@ void ghostty_surface_pipe_write(
 );
 ```
 
-### 6.2 实现 (`src/apprt/embedded.zig`)
+### 7.2 实现 (`src/apprt/embedded.zig`)
 
 ```zig
 /// 使用管道后端创建 Surface
@@ -839,13 +1168,13 @@ const PipeConfig = extern struct {
 
 ---
 
-## 7. libxev iOS 修复方案
+## 8. libxev iOS 修复方案
 
-### 7.1 问题分析
+### 8.1 问题分析
 
 libxev 在 iOS 上的主要问题是 `xev.Process` 使用 `EVFILT_PROC`，这在 iOS 沙盒中被禁用。
 
-### 7.2 修复策略
+### 8.2 修复策略
 
 **方案 A: 禁用 Process 监视 (推荐)**
 
@@ -878,7 +1207,7 @@ else
     };
 ```
 
-### 7.3 安全的 xev 组件
+### 8.3 安全的 xev 组件
 
 以下 xev 组件在 iOS 上应该可以正常工作：
 
@@ -892,9 +1221,9 @@ else
 
 ---
 
-## 8. 宿主应用集成
+## 9. 宿主应用集成
 
-### 8.1 Swift 集成示例
+### 9.1 Swift 集成示例
 
 ```swift
 import GhosttyKit
@@ -966,7 +1295,7 @@ class PipeTerminalBackend {
 
 ---
 
-## 9. 实施步骤
+## 10. 实施步骤
 
 ### 阶段 1: 基础管道后端 (1 周)
 
@@ -995,7 +1324,7 @@ class PipeTerminalBackend {
 
 ---
 
-## 10. 关键文件变更清单
+## 11. 关键文件变更清单
 
 | 文件 | 操作 | 变更内容 |
 |------|------|---------|
@@ -1009,7 +1338,7 @@ class PipeTerminalBackend {
 
 ---
 
-## 11. 与上游协作建议
+## 12. 与上游协作建议
 
 根据 GitHub Discussion #4087 中 mitchellh 的表态：
 
