@@ -1338,7 +1338,313 @@ class PipeTerminalBackend {
 
 ---
 
-## 12. 与上游协作建议
+## 12. SwiftTerm iOS 架构参考
+
+[SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) 是一个成熟的 Swift 终端模拟器实现，其 iOS 架构对 libghostty iOS 改造具有重要参考价值。
+
+### 12.1 SwiftTerm 架构概述
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        SwiftTerm 架构                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                    Terminal (核心引擎)                            │   │
+│  │  • VT100/Xterm 转义序列解析                                       │   │
+│  │  • 双缓冲区管理 (normalBuffer + altBuffer)                        │   │
+│  │  • UTF-8 处理 (ReadingBuffer with putback)                       │   │
+│  │  • TerminalDelegate 回调接口                                      │   │
+│  └────────────────────────────┬────────────────────────────────────┘   │
+│                               │                                         │
+│                               ▼                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                 TerminalView (iOS/UIKit)                         │   │
+│  │  • 继承 UIScrollView                                              │   │
+│  │  • 实现 TerminalDelegate                                          │   │
+│  │  • CADisplayLink 渲染同步                                         │   │
+│  │  • UITextInput 键盘支持                                           │   │
+│  │  • 手势识别 (tap, pan, long-press)                                │   │
+│  └────────────────────────────┬────────────────────────────────────┘   │
+│                               │                                         │
+│                               ▼                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │              TerminalViewDelegate (宿主应用)                      │   │
+│  │  • send(source:data:) - 发送用户输入                              │   │
+│  │  • sizeChanged() - 终端尺寸变化                                   │   │
+│  │  • hostCurrentDirectory() - 当前目录                              │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 12.2 关键设计模式
+
+#### 12.2.1 双向委托模式 (Dual Delegation)
+
+SwiftTerm 使用两层委托实现解耦：
+
+| 委托层 | 接口 | 方向 | 用途 |
+|--------|------|------|------|
+| **Terminal → View** | `TerminalDelegate` | 内 → 外 | 终端状态变化通知 |
+| **View → Host** | `TerminalViewDelegate` | 视图 → 宿主 | 用户交互转发 |
+
+```swift
+// TerminalDelegate - 终端引擎回调
+protocol TerminalDelegate {
+    func send(source: Terminal, data: ArraySlice<UInt8>)  // 终端生成的数据
+    func showCursor(source: Terminal)
+    func hideCursor(source: Terminal)
+    func scrolled(source: Terminal, yDisp: Int)
+    func linefeed(source: Terminal)
+    func cursorStyleChanged(source: Terminal, newStyle: CursorStyle)
+    func setTerminalTitle(source: Terminal, title: String)
+    func colorChanged(source: Terminal, idx: Int, color: Color)
+}
+
+// TerminalViewDelegate - 视图层回调
+protocol TerminalViewDelegate {
+    func send(source: TerminalView, data: ArraySlice<UInt8>)  // 用户输入
+    func sizeChanged(source: TerminalView, newCols: Int, newRows: Int)
+    func requestOpenLink(source: TerminalView, link: String, params: [String:String])
+    func clipboardCopy(source: TerminalView, content: Data)
+}
+```
+
+#### 12.2.2 数据流分离
+
+```
+输入流 (用户 → 远程):
+┌──────────┐   UITextInput    ┌──────────────┐   delegate.send()   ┌──────────┐
+│ Keyboard │ ───────────────► │ TerminalView │ ──────────────────► │ SSH/Pipe │
+└──────────┘                  └──────────────┘                     └──────────┘
+
+输出流 (远程 → 显示):
+┌──────────┐   terminal.feed()  ┌──────────┐   TerminalDelegate   ┌──────────────┐
+│ SSH/Pipe │ ─────────────────► │ Terminal │ ───────────────────► │ TerminalView │
+└──────────┘                    └──────────┘                      └──────────────┘
+```
+
+#### 12.2.3 iOS SSH 实现 (UIKitSshTerminalView)
+
+SwiftTerm 的 iOS SSH 示例展示了关键的异步 I/O 模式：
+
+```swift
+class SshTerminalView: TerminalView, TerminalViewDelegate {
+    var shell: SSHShell?
+    let sshQueue = DispatchQueue(label: "SSH Queue")
+
+    func connect() {
+        sshQueue.async {
+            self.shell = try? SSHShell(host: "example.com", port: 22)
+            self.shell?.connect()
+                .authenticate(...)
+                .open { [weak self] data in
+                    // 接收 SSH 数据，分块处理
+                    self?.processSSHData(data)
+                }
+        }
+    }
+
+    private func processSSHData(_ data: Data) {
+        // 分块避免阻塞 UI
+        let chunkSize = 1024
+        var offset = 0
+        while offset < data.count {
+            let chunk = data[offset..<min(offset + chunkSize, data.count)]
+            DispatchQueue.main.sync {
+                // 必须在主线程 feed 终端
+                self.getTerminal().feed(buffer: Array(chunk))
+            }
+            offset += chunkSize
+        }
+    }
+
+    // TerminalViewDelegate: 用户输入
+    func send(source: TerminalView, data: ArraySlice<UInt8>) {
+        sshQueue.async {
+            self.shell?.write(Data(data))
+        }
+    }
+
+    // 终端尺寸变化
+    func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
+        sshQueue.async {
+            self.shell?.setTerminalSize(width: newCols, height: newRows)
+        }
+    }
+}
+```
+
+### 12.3 对 libghostty iOS 改造的启示
+
+#### 12.3.1 架构映射
+
+| SwiftTerm 组件 | libghostty 对应 | 改造建议 |
+|----------------|-----------------|----------|
+| `Terminal` | `terminal.Terminal` | 保持不变，核心引擎已解耦 |
+| `TerminalView` | Metal 渲染视图 | 使用现有渲染器 |
+| `TerminalDelegate` | 回调机制 | 已存在，无需修改 |
+| `TerminalViewDelegate` | C API 回调 | 需扩展 |
+| SSH 后端 | **需新增** | 管道后端 (`termio.Pipe`) |
+
+#### 12.3.2 推荐的 C API 回调结构
+
+基于 SwiftTerm 的委托模式，libghostty 应添加以下回调：
+
+```c
+// ghostty.h - iOS 回调结构
+typedef struct {
+    // 用户输入回调 (对应 TerminalViewDelegate.send)
+    void (*on_user_input)(void* userdata, const uint8_t* data, size_t len);
+
+    // 终端输出回调 (对应 SSH data handler)
+    void (*on_terminal_output)(void* userdata, const uint8_t* data, size_t len);
+
+    // 尺寸变化回调
+    void (*on_size_change)(void* userdata, uint16_t cols, uint16_t rows,
+                           uint16_t width_px, uint16_t height_px);
+
+    // 标题变化回调
+    void (*on_title_change)(void* userdata, const char* title);
+
+    // 剪贴板回调
+    void (*on_clipboard_copy)(void* userdata, const uint8_t* data, size_t len);
+
+    // 链接打开请求
+    void (*on_link_open)(void* userdata, const char* url);
+
+    void* userdata;
+} ghostty_ios_callbacks_s;
+
+// 创建带回调的 Surface
+ghostty_surface_t ghostty_surface_new_ios(
+    ghostty_app_t app,
+    const ghostty_surface_config_s* config,
+    const ghostty_ios_callbacks_s* callbacks
+);
+
+// 向终端输入数据 (从 SSH 接收的数据)
+void ghostty_surface_feed_input(
+    ghostty_surface_t surface,
+    const uint8_t* data,
+    size_t len
+);
+```
+
+#### 12.3.3 Swift 封装示例
+
+```swift
+import GhosttyKit
+
+/// libghostty iOS 包装器，采用 SwiftTerm 风格的委托模式
+class GhosttyTerminal {
+    private var surface: ghostty_surface_t?
+    private var app: ghostty_app_t?
+
+    weak var delegate: GhosttyTerminalDelegate?
+
+    // 用于 SSH/管道数据的队列
+    private let ioQueue = DispatchQueue(label: "io.ghostty.ios")
+
+    init(config: GhosttyConfig) throws {
+        // 创建 App
+        var appConfig = ghostty_config_new()
+        // 配置...
+        app = ghostty_app_new(&appConfig)
+
+        // 设置回调
+        var callbacks = ghostty_ios_callbacks_s()
+        callbacks.userdata = Unmanaged.passUnretained(self).toOpaque()
+        callbacks.on_terminal_output = { userdata, data, len in
+            let this = Unmanaged<GhosttyTerminal>.fromOpaque(userdata!).takeUnretainedValue()
+            let buffer = Data(bytes: data!, count: len)
+            DispatchQueue.main.async {
+                this.delegate?.terminal(this, didReceiveOutput: buffer)
+            }
+        }
+        callbacks.on_size_change = { userdata, cols, rows, width, height in
+            let this = Unmanaged<GhosttyTerminal>.fromOpaque(userdata!).takeUnretainedValue()
+            this.delegate?.terminal(this, didChangeSize: (cols, rows))
+        }
+        // 其他回调...
+
+        // 创建 Surface
+        var surfaceConfig = ghostty_surface_config_new()
+        // 配置...
+        surface = ghostty_surface_new_ios(app, &surfaceConfig, &callbacks)
+    }
+
+    /// 向终端 feed 数据 (来自 SSH)
+    /// 采用 SwiftTerm 的分块处理模式
+    func feed(data: Data) {
+        ioQueue.async { [weak self] in
+            guard let self = self, let surface = self.surface else { return }
+
+            // 分块处理大数据，避免阻塞
+            let chunkSize = 4096
+            var offset = 0
+            while offset < data.count {
+                let end = min(offset + chunkSize, data.count)
+                data[offset..<end].withUnsafeBytes { bytes in
+                    ghostty_surface_feed_input(surface, bytes.baseAddress, bytes.count)
+                }
+                offset = end
+            }
+        }
+    }
+
+    /// 发送用户输入
+    func send(data: Data) {
+        guard let surface = surface else { return }
+        data.withUnsafeBytes { bytes in
+            ghostty_surface_key_input(surface, bytes.baseAddress, bytes.count)
+        }
+    }
+}
+
+protocol GhosttyTerminalDelegate: AnyObject {
+    func terminal(_ terminal: GhosttyTerminal, didReceiveOutput data: Data)
+    func terminal(_ terminal: GhosttyTerminal, didChangeSize size: (cols: UInt16, rows: UInt16))
+}
+```
+
+### 12.4 SwiftTerm 与 libghostty 对比
+
+| 特性 | SwiftTerm | libghostty (改造后) |
+|------|-----------|---------------------|
+| **语言** | 纯 Swift | Zig + C API + Swift 包装 |
+| **终端模拟** | 自实现 VT100/Xterm | 完整 Ghostty 引擎 |
+| **渲染** | CoreText + NSAttributedString | Metal GPU 加速 |
+| **字体** | 系统字体 | 自定义字体渲染 |
+| **Unicode** | 基础支持 | 完整 Unicode 15.1 |
+| **性能** | 良好 | 优秀 (Metal) |
+| **功能完整性** | 基础终端 | 完整桌面级终端 |
+| **iOS 原生支持** | ✅ 原生 | ⚠️ 需改造 |
+
+### 12.5 从 SwiftTerm 学到的关键教训
+
+1. **解耦 I/O 和渲染**
+   - SwiftTerm 将终端引擎与 I/O 后端完全分离
+   - libghostty 的管道后端需要遵循同样原则
+
+2. **异步 I/O 必须使用专用队列**
+   - SSH 操作在 `DispatchQueue` 上执行
+   - 终端更新通过 `DispatchQueue.main.sync` 同步到主线程
+   - libghostty 的 `xev.Loop` 需要与 GCD 协调
+
+3. **分块处理大数据**
+   - SwiftTerm 以 1KB 块处理 SSH 数据
+   - 避免大量数据阻塞 UI
+   - libghostty 管道后端应采用类似策略
+
+4. **委托模式简化集成**
+   - 清晰的回调接口比直接管道 FD 更易使用
+   - libghostty C API 应提供回调选项
+
+---
+
+## 13. 与上游协作建议
 
 根据 GitHub Discussion #4087 中 mitchellh 的表态：
 
@@ -1353,3 +1659,25 @@ class PipeTerminalBackend {
    - PR 3: C API 扩展
 3. **保持兼容** - 不破坏现有 POSIX/Windows 功能
 4. **文档完善** - 添加 iOS 集成指南
+
+---
+
+## 14. 总结与工作量评估
+
+### 14.1 核心改造任务
+
+| 任务 | 复杂度 | 工作量 | 优先级 |
+|------|--------|--------|--------|
+| libxev iOS 修复 (PipeAsync) | 高 | 4-5 天 | P0 |
+| termio.Pipe 后端实现 | 中 | 5-7 天 | P0 |
+| C API 扩展 | 低 | 2-3 天 | P1 |
+| Swift 封装层 | 中 | 3-4 天 | P1 |
+| iOS 集成测试 | 中 | 3-4 天 | P1 |
+| **总计** | | **3-4 周** | |
+
+### 14.2 参考资源
+
+- [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) - iOS 终端实现参考
+- [SwiftTermApp](https://github.com/migueldeicaza/SwiftTermApp) - 完整 iOS SSH 应用
+- [GitHub Discussion #4087](https://github.com/ghostty-org/ghostty/discussions/4087) - iOS 兼容性讨论
+- [libxev](https://github.com/Cloudef/libxev) - 事件循环库
